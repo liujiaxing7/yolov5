@@ -193,7 +193,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             ema.updates = ckpt['updates']
 
         # Epochs
-        start_epoch = ckpt['epoch'] + 1
+        start_epoch = 201
         if resume:
             assert start_epoch > 0, f'{weights} training to {epochs} epochs is finished, nothing to resume.'
         if epochs < start_epoch:
@@ -214,13 +214,28 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         LOGGER.info('Using SyncBatchNorm()')
 
     # Trainloader
+    assert opt.oversample_class >= -1, '--oversample-class must be -1 or a non-negative class ID'
+    fixed_image_oversampling = opt.oversample_class >= 0 and opt.oversample_weight != 1
+    assert not (opt.image_weights and fixed_image_oversampling), \
+        '--image-weights cannot be combined with fixed image oversampling'
+    weighted_image_sampling = opt.image_weights or fixed_image_oversampling
     train_loader, dataset = create_dataloader(train_path, imgsz, batch_size // WORLD_SIZE, gs, single_cls,
                                               hyp=hyp, augment=True, cache=opt.cache, rect=opt.rect, rank=LOCAL_RANK,
-                                              workers=workers, image_weights=opt.image_weights, quad=opt.quad,
+                                              workers=workers, image_weights=weighted_image_sampling, quad=opt.quad,
                                               prefix=colorstr('train: '), shuffle=True)
     mlc = int(np.concatenate(dataset.labels, 0)[:, 0].max())  # max label class
-    nb = len(train_loader)  # number of batches
     assert mlc < nc, f'Label class {mlc} exceeds nc={nc} in {data}. Possible class labels are 0-{nc - 1}'
+    if fixed_image_oversampling:
+        assert opt.oversample_class < nc, \
+            f'--oversample-class must be in 0-{nc - 1}, got {opt.oversample_class}'
+        assert opt.oversample_weight > 1, '--oversample-weight must be an integer greater than 1'
+        matching_images = {i for i, labels in enumerate(dataset.labels)
+                           if (labels[:, 0] == opt.oversample_class).any()}
+        dataset.indices = [i for i in range(dataset.n)
+                           for _ in range(opt.oversample_weight if i in matching_images else 1)]
+        LOGGER.info(f'Fixed image oversampling: class {opt.oversample_class} occurs in {len(matching_images)}/{dataset.n} '
+                    f'images and is repeated {opt.oversample_weight} times per epoch')
+    nb = len(train_loader)  # number of batches
 
     # Process 0
     if RANK in [-1, 0]:
@@ -282,7 +297,6 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             cw = model.class_weights.cpu().numpy() * (1 - maps) ** 2 / nc  # class weights
             iw = labels_to_image_weights(dataset.labels, nc=nc, class_weights=cw)  # image weights
             dataset.indices = random.choices(range(dataset.n), weights=iw, k=dataset.n)  # rand weighted idx
-
         # Update mosaic border (optional)
         # b = int(random.uniform(0.25 * imgsz, 0.75 * imgsz + gs) // gs * gs)
         # dataset.mosaic_border = [b - imgsz, -b]  # height, width borders
@@ -460,6 +474,10 @@ def parse_opt(known=False):
     parser.add_argument('--bucket', type=str, default='', help='gsutil bucket')
     parser.add_argument('--cache', type=str, nargs='?', const='ram', help='--cache images in "ram" (default) or "disk"')
     parser.add_argument('--image-weights', action='store_true', help='use weighted image selection for training')
+    parser.add_argument('--oversample-class', type=int, default=-1,
+                        help='0-based class ID to oversample at image level; -1 disables fixed oversampling')
+    parser.add_argument('--oversample-weight', type=int, default=1,
+                        help='times each image containing --oversample-class is used per epoch (e.g. 5)')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--multi-scale', action='store_true', help='vary img-size +/- 50%%')
     parser.add_argument('--single-cls', action='store_true', help='train multi-class data as single-class')
@@ -517,6 +535,8 @@ def main(opt, callbacks=Callbacks()):
         assert torch.cuda.device_count() > LOCAL_RANK, 'insufficient CUDA devices for DDP command'
         assert opt.batch_size % WORLD_SIZE == 0, '--batch-size must be multiple of CUDA device count'
         assert not opt.image_weights, '--image-weights argument is not compatible with DDP training'
+        assert opt.oversample_class < 0 or opt.oversample_weight == 1, \
+            'fixed image oversampling is not compatible with DDP training'
         assert not opt.evolve, '--evolve argument is not compatible with DDP training'
         torch.cuda.set_device(LOCAL_RANK)
         device = torch.device('cuda', LOCAL_RANK)

@@ -117,7 +117,7 @@ def create_dataloader(path, imgsz, batch_size, stride, single_cls=False, hyp=Non
                   shuffle=shuffle and sampler is None,
                   num_workers=nw,
                   sampler=sampler,
-                  pin_memory=True,
+                  pin_memory=False,
                   collate_fn=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn), dataset
 
 
@@ -541,7 +541,7 @@ class LoadImagesAndLabels(Dataset):
         return x
 
     def __len__(self):
-        return len(self.img_files)
+        return len(self.indices)
 
     # def __iter__(self):
     #     self.count = -1
